@@ -390,6 +390,45 @@ HPDF_Image_LoadPngImage  (HPDF_MMgr        mmgr,
     return image;
 }
 
+HPDF_STATUS HPDF_Image_CreateAndAddSMask(HPDF_Image image, HPDF_Xref xref, HPDF_BYTE *data, HPDF_UINT width, HPDF_UINT height) {
+    HPDF_STATUS ret;
+    HPDF_Dict smask;
+
+    smask = HPDF_DictStream_New (image->mmgr, xref);
+    if (!smask) {
+        return HPDF_FAILD_TO_ALLOC_MEM;
+    }
+
+    smask->filter = image->filter;
+    smask->header.obj_class |= HPDF_OSUBCLASS_XOBJECT;
+
+    ret = HPDF_Dict_AddName (smask, "Type", "XObject");
+    ret += HPDF_Dict_AddName (smask, "Subtype", "Image");
+    ret += HPDF_Dict_AddNumber (smask, "Width", (HPDF_UINT)width);
+    ret += HPDF_Dict_AddNumber (smask, "Height", (HPDF_UINT)height);
+    ret += HPDF_Dict_AddName (smask, "ColorSpace", "DeviceGray");
+    ret += HPDF_Dict_AddNumber (smask, "BitsPerComponent", (HPDF_UINT)8);
+
+    if (ret != HPDF_OK) {
+        HPDF_Dict_Free(smask);
+        return HPDF_INVALID_PNG_IMAGE;
+    }
+
+    if (HPDF_Stream_Write(smask->stream, data, width * height) != HPDF_OK) {
+        HPDF_Dict_Free(smask);
+        return HPDF_FILE_IO_ERROR;
+    }
+
+    ret = HPDF_Dict_Add (image, "SMask", smask);
+    if (ret != HPDF_OK) {
+        HPDF_Dict_Free(smask);
+        return ret;
+    }
+
+    return HPDF_OK;
+}
+
+
 
 static HPDF_STATUS
 LoadPngData  (HPDF_Dict     image,
@@ -422,7 +461,7 @@ LoadPngData  (HPDF_Dict     image,
 		HPDF_SetError (image->error, HPDF_FAILD_TO_ALLOC_MEM, 0);
 		goto Exit;
 	}
-    
+
 	png_set_sig_bytes (png_ptr, HPDF_PNG_BYTES_TO_CHECK);
 	png_set_read_fn (png_ptr, (void *)png_data, (png_rw_ptr)&PngReadFunc);
 
@@ -452,7 +491,6 @@ LoadPngData  (HPDF_Dict     image,
 	if (xref && PNG_COLOR_TYPE_PALETTE & color_type) {
 		png_bytep trans;
 		int num_trans;
-		HPDF_Dict smask;
 		png_bytep smask_data;
 
 		if (!png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS) ||
@@ -460,54 +498,31 @@ LoadPngData  (HPDF_Dict     image,
 			goto no_transparent_color_in_palette;
 		}
 
-		smask = HPDF_DictStream_New (image->mmgr, xref);
-		if (!smask) {
-			ret = HPDF_FAILD_TO_ALLOC_MEM;
-			goto Exit;
-		}
-
-		smask->header.obj_class |= HPDF_OSUBCLASS_XOBJECT;
-		ret = HPDF_Dict_AddName (smask, "Type", "XObject");
-		ret += HPDF_Dict_AddName (smask, "Subtype", "Image");
-		ret += HPDF_Dict_AddNumber (smask, "Width", (HPDF_UINT)width);
-		ret += HPDF_Dict_AddNumber (smask, "Height", (HPDF_UINT)height);
-		ret += HPDF_Dict_AddName (smask, "ColorSpace", "DeviceGray");
-		ret += HPDF_Dict_AddNumber (smask, "BitsPerComponent", (HPDF_UINT)bit_depth);
-
-		if (ret != HPDF_OK) {
-			HPDF_Dict_Free(smask);
-			ret = HPDF_INVALID_PNG_IMAGE;
-			goto Exit;
-		}
-
+        // @Stability: Careful! GetMem and ReadTransparentPaletteData assume 8 bit depth!
 		smask_data = HPDF_GetMem(image->mmgr, width * height);
 		if (!smask_data) {
-			HPDF_Dict_Free(smask);
 			ret = HPDF_FAILD_TO_ALLOC_MEM;
 			goto Exit;
 		}
 
 		if (ReadTransparentPaletteData(image, png_ptr, info_ptr, smask_data, trans, num_trans) != HPDF_OK) {
 			HPDF_FreeMem(image->mmgr, smask_data);
-			HPDF_Dict_Free(smask);
 			ret = HPDF_INVALID_PNG_IMAGE;
 			goto Exit;
 		}
 
-		if (HPDF_Stream_Write(smask->stream, smask_data, width * height) != HPDF_OK) {
+        ret = HPDF_Image_CreateAndAddSMask(image, xref, smask_data, (HPDF_UINT) width, (HPDF_UINT) height);
+        if (ret != HPDF_OK) {
 			HPDF_FreeMem(image->mmgr, smask_data);
-			HPDF_Dict_Free(smask);
-			ret = HPDF_FILE_IO_ERROR;
-			goto Exit;
-		}
-		HPDF_FreeMem(image->mmgr, smask_data);
+            goto Exit;
+        }
 
+		HPDF_FreeMem(image->mmgr, smask_data);
 
 		ret += CreatePallet(image, png_ptr, info_ptr);
 		ret += HPDF_Dict_AddNumber (image, "Width", (HPDF_UINT)width);
 		ret += HPDF_Dict_AddNumber (image, "Height", (HPDF_UINT)height);
 		ret += HPDF_Dict_AddNumber (image, "BitsPerComponent",	(HPDF_UINT)bit_depth);
-		ret += HPDF_Dict_Add (image, "SMask", smask);
 
 		png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
 		return HPDF_OK;
@@ -518,51 +533,27 @@ no_transparent_color_in_palette:
 	/* read images with alpha channel right away
 	   we have to do this because image transparent mask must be added to the Xref */
 	if (xref && PNG_COLOR_MASK_ALPHA & color_type) {
-		HPDF_Dict smask;
 		png_bytep smask_data;
 
-		smask = HPDF_DictStream_New (image->mmgr, xref);
-		if (!smask) {
-			ret = HPDF_FAILD_TO_ALLOC_MEM;
-			goto Exit;
-		}
-
-		smask->filter = image->filter;
-		smask->header.obj_class |= HPDF_OSUBCLASS_XOBJECT;
-
-		ret = HPDF_Dict_AddName (smask, "Type", "XObject");
-		ret += HPDF_Dict_AddName (smask, "Subtype", "Image");
-		ret += HPDF_Dict_AddNumber (smask, "Width", (HPDF_UINT)width);
-		ret += HPDF_Dict_AddNumber (smask, "Height", (HPDF_UINT)height);
-		ret += HPDF_Dict_AddName (smask, "ColorSpace", "DeviceGray");
-		ret += HPDF_Dict_AddNumber (smask, "BitsPerComponent", (HPDF_UINT)bit_depth);
-
-		if (ret != HPDF_OK) {
-			HPDF_Dict_Free(smask);
-			ret = HPDF_INVALID_PNG_IMAGE;
-			goto Exit;
-		}
-
+        // @Stability: Careful! GetMem and ReadTransparentPngData assume 8 bit depth!
 		smask_data = HPDF_GetMem(image->mmgr, width * height);
 		if (!smask_data) {
-			HPDF_Dict_Free(smask);
 			ret = HPDF_FAILD_TO_ALLOC_MEM;
 			goto Exit;
 		}
 
 		if (ReadTransparentPngData(image, png_ptr, info_ptr, smask_data) != HPDF_OK) {
 			HPDF_FreeMem(image->mmgr, smask_data);
-			HPDF_Dict_Free(smask);
 			ret = HPDF_INVALID_PNG_IMAGE;
 			goto Exit;
 		}
 
-		if (HPDF_Stream_Write(smask->stream, smask_data, width * height) != HPDF_OK) {
+        ret = HPDF_Image_CreateAndAddSMask(image, xref, smask_data, (HPDF_UINT) width, (HPDF_UINT) height);
+        if (ret != HPDF_OK) {
 			HPDF_FreeMem(image->mmgr, smask_data);
-			HPDF_Dict_Free(smask);
-			ret = HPDF_FILE_IO_ERROR;
-			goto Exit;
-		}
+            goto Exit;
+        }
+
 		HPDF_FreeMem(image->mmgr, smask_data);
 
 		if (color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
@@ -573,7 +564,6 @@ no_transparent_color_in_palette:
 		ret += HPDF_Dict_AddNumber (image, "Width", (HPDF_UINT)width);
 		ret += HPDF_Dict_AddNumber (image, "Height", (HPDF_UINT)height);
 		ret += HPDF_Dict_AddNumber (image, "BitsPerComponent",	(HPDF_UINT)bit_depth);
-		ret += HPDF_Dict_Add (image, "SMask", smask);
 
 		png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
 		return HPDF_OK;
