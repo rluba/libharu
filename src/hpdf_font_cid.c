@@ -64,6 +64,8 @@ CreateCMap  (HPDF_Encoder   encoder,
              HPDF_Xref      xref);
 
 
+static HPDF_Dict CreateToUnicodeCMap (HPDF_Encoder encoder, HPDF_Xref xref);
+
 static void
 OnFree_Func  (HPDF_Dict  obj);
 
@@ -148,21 +150,21 @@ HPDF_Type0Font_New  (HPDF_MMgr        mmgr,
 	 * does work. Who can understand that ?
 	 */
         if (HPDF_StrCmp(encoder_attr->ordering, "Identity-H") == 0) {
-	    ret += HPDF_Dict_AddName (font, "Encoding", "Identity-H");
-	    attr->cmap_stream = CreateCMap (encoder, xref);
+			ret += HPDF_Dict_AddName (font, "Encoding", "Identity-H");
+			attr->cmap_stream = CreateToUnicodeCMap (encoder, xref);
 
-	    if (attr->cmap_stream) {
-	        ret += HPDF_Dict_Add (font, "ToUnicode", attr->cmap_stream);
-	    } else
-	        return NULL;
-	} else {
-            attr->cmap_stream = CreateCMap (encoder, xref);
+			if (attr->cmap_stream) {
+				ret += HPDF_Dict_Add (font, "ToUnicode", attr->cmap_stream);
+			} else
+				return NULL;
+		} else {
+				attr->cmap_stream = CreateCMap (encoder, xref);
 
-	    if (attr->cmap_stream) {
-	        ret += HPDF_Dict_Add (font, "Encoding", attr->cmap_stream);
-	    } else
-	      return NULL;
-	}
+			if (attr->cmap_stream) {
+				ret += HPDF_Dict_Add (font, "Encoding", attr->cmap_stream);
+			} else
+			  return NULL;
+		}
     }
 
     if (ret != HPDF_OK)
@@ -861,6 +863,96 @@ CidRangeToHex  (char        *s,
 
     return pbuf;
 }
+
+/* New: real /ToUnicode CMap (CMapType 2, bfrange) */
+static HPDF_Dict CreateToUnicodeCMap (HPDF_Encoder encoder, HPDF_Xref xref)
+{
+	HPDF_STATUS ret = HPDF_OK;
+	HPDF_Dict cmap = HPDF_DictStream_New (encoder->mmgr, xref);
+	HPDF_Dict sysinfo;
+	char buf[HPDF_TMP_BUF_SIZ];
+	char *pbuf;
+	char *eptr = buf + HPDF_TMP_BUF_SIZ - 1;
+	HPDF_UINT hi;
+	HPDF_UINT remaining;
+
+	if (!cmap)
+		return NULL;
+
+	ret += HPDF_Dict_AddName (cmap, "Type", "CMap");
+	ret += HPDF_Dict_AddName (cmap, "CMapName", "Adobe-Identity-UCS");
+
+	sysinfo = HPDF_Dict_New (encoder->mmgr);
+	if (!sysinfo)
+		return NULL;
+	if (HPDF_Dict_Add (cmap, "CIDSystemInfo", sysinfo) != HPDF_OK)
+		return NULL;
+	ret += HPDF_Dict_Add (sysinfo, "Registry",
+			HPDF_String_New (encoder->mmgr, "Adobe", NULL));
+	ret += HPDF_Dict_Add (sysinfo, "Ordering",
+			HPDF_String_New (encoder->mmgr, "UCS", NULL));
+	ret += HPDF_Dict_AddNumber (sysinfo, "Supplement", 0);
+
+	ret += HPDF_Stream_WriteStr (cmap->stream,
+			"/CIDInit /ProcSet findresource begin\r\n"
+			"12 dict begin\r\n"
+			"begincmap\r\n"
+			"/CIDSystemInfo 3 dict dup begin\r\n"
+			"  /Registry (Adobe) def\r\n"
+			"  /Ordering (UCS) def\r\n"
+			"  /Supplement 0 def\r\n"
+			"end def\r\n"
+			"/CMapName /Adobe-Identity-UCS def\r\n"
+			"/CMapType 2 def\r\n"
+			"1 begincodespacerange\r\n"
+			"<0000> <FFFF>\r\n"
+			"endcodespacerange\r\n");
+
+	/* One bfrange per high byte (skipping UTF-16 surrogates D8..DF),
+	 * grouped into begin/endbfrange blocks of at most 100 entries.
+	 * Both constraints are required by the Adobe CMap spec and enforced
+	 * by macOS Preview / CoreGraphics. */
+	remaining = 256 - 8; /* 248 high bytes */
+	hi = 0;
+	while (remaining > 0) {
+		HPDF_UINT chunk = (remaining > 100) ? 100 : remaining;
+		HPDF_UINT j;
+
+		pbuf = HPDF_IToA (buf, chunk, eptr);
+		HPDF_StrCpy (pbuf, " beginbfrange\r\n", eptr);
+		ret += HPDF_Stream_WriteStr (cmap->stream, buf);
+
+		for (j = 0; j < chunk; ) {
+			if (hi >= 0xD8 && hi <= 0xDF) { hi++; continue; }
+
+			/* "<hh00> <hhFF> <hh00>\r\n" */
+			pbuf = CidRangeToHex (buf, (HPDF_UINT16)(hi << 8),
+					(HPDF_UINT16)((hi << 8) | 0xFF), eptr);
+			*pbuf++ = ' ';
+			pbuf = UINT16ToHex (pbuf, (HPDF_UINT16)(hi << 8), eptr, 2);
+			HPDF_StrCpy (pbuf, "\r\n", eptr);
+			ret += HPDF_Stream_WriteStr (cmap->stream, buf);
+
+			hi++;
+			j++;
+		}
+
+		ret += HPDF_Stream_WriteStr (cmap->stream, "endbfrange\r\n");
+		remaining -= chunk;
+	}
+
+	ret += HPDF_Stream_WriteStr (cmap->stream,
+			"endcmap\r\n"
+			"CMapName currentdict /CMap defineresource pop\r\n"
+			"end\r\n"
+			"end\r\n");
+
+	if (ret != HPDF_OK)
+		return NULL;
+
+	return cmap;
+}
+
 
 static HPDF_Dict
 CreateCMap  (HPDF_Encoder   encoder,
